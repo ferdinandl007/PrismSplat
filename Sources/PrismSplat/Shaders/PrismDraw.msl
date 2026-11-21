@@ -1,0 +1,22 @@
+vertex FragmentIn prismSplatVertex(uint vertexID [[vertex_id]], uint instance [[instance_id]],
+                                    uint eye [[amplification_id]],
+                                    constant UniformsArray &uniforms [[buffer(0)]],
+                                    device const Splat *splats [[buffer(1)]],
+                                    device const uint2 *order [[buffer(2)]],
+                                    device const SortState *state [[buffer(3)]],
+                                    device const half *harmonics [[buffer(4)]]) {
+    uint i = instance * splatsPerInstance + vertexID / 4;
+    if (i >= state->visible) {
+        FragmentIn out = {};
+        out.position = float4(1, 1, 0, 1);
+        return out;
+    }
+    uint splat = order[i].y;
+    return splatVertex(splats[splat], uniforms.uniforms[min(eye, 1u)], vertexID % 4,
+                       harmonics, SHDegree1, splat);
+}
+
+fragment half4 prismSplatFragment(FragmentIn in [[stage_in]]) {
+    half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
+    return half4(in.color.rgb * alpha, alpha);
+}

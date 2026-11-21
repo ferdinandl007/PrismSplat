@@ -1,0 +1,140 @@
+// Eight neighboring source records can be replaced by one moment-matched Gaussian.
+// All coefficients are in capture space. Full detail always uses the original records.
+constant uint lodFanout = 8;
+constant uint rateCells = 128;
+
+inline float3x3 lodCovariance(Splat p) {
+    float3 a = float3(p.covA), b = float3(p.covB);
+    return float3x3(float3(a.x,a.y,a.z), float3(a.y,b.x,b.y), float3(a.z,b.y,b.z));
+}
+
+inline float lodArea(float3x3 c) {
+    return sqrt(max(1e-16f, c[0][0]*c[1][1] + c[0][0]*c[2][2] + c[1][1]*c[2][2]
+                         - c[0][1]*c[0][1] - c[0][2]*c[0][2] - c[1][2]*c[1][2]));
+}
+
+inline float lodRadius(float3x3 c) {
+    return 3.02f * sqrt(max(0.f, c[0][0] + c[1][1] + c[2][2]));
+}
+
+kernel void prismMakeParents(device Splat *points [[buffer(0)]], device half *sh [[buffer(1)]],
+                              device float4 *bounds [[buffer(2)]], constant uint4 &level [[buffer(3)]],
+#if PRISM_SPATIAL_LOD
+                              device const uint *leafIDs [[buffer(4)]],
+#endif
+                              uint group [[thread_position_in_grid]]) {
+    uint first = level.x + group * lodFanout, end = min(first + lodFanout, level.x + level.y);
+    if (first >= end) return;
+    uint parent = level.z + group;
+    uint boundID = parent - level.w;
+    float3 center = 0, dc = 0;
+    float mass = 0, weight[lodFanout];
+    for (uint i = first; i < end; ++i) {
+        uint source = i;
+#if PRISM_SPATIAL_LOD
+        if (level.x == 0) source = leafIDs[i];
+#endif
+        Splat p = points[source];
+        float w = max(0.f, float(p.color.a)) * lodArea(lodCovariance(p));
+        weight[i-first] = w;
+        center += w * float3(p.position);
+        dc += w * float3(p.color.rgb);
+        mass += w;
+    }
+    if (mass < 1e-14f) {
+        points[parent] = Splat{};
+        for (uint j=0; j<9; ++j) sh[parent*9+j] = 0;
+        bounds[boundID] = float4(0,0,0,INFINITY);
+        return;
+    }
+    center /= mass;
+    float3x3 cov(0.f);
+    float coeff[9] = {};
+    float radius = 0;
+    for (uint i = first; i < end; ++i) {
+        uint source = i;
+#if PRISM_SPATIAL_LOD
+        if (level.x == 0) source = leafIDs[i];
+#endif
+        Splat p = points[source];
+        float3 delta = float3(p.position) - center;
+        float3x3 leaf = lodCovariance(p);
+        float w = weight[i-first] / mass;
+        cov += w * (leaf + float3x3(delta * delta.x, delta * delta.y, delta * delta.z));
+        radius = max(radius, length(delta) + (level.x == 0 ? lodRadius(leaf) : bounds[i-level.w].w));
+        for (uint j = 0; j < 9; ++j) coeff[j] += w * float(sh[source * 9 + j]);
+    }
+    Splat merged;
+    merged.position = packed_float3(center);
+    merged.color = packed_half4(half4(half3(dc / mass), half(min(1.f, mass / lodArea(cov)))));
+    merged.covA = packed_half3(half3(cov[0][0],cov[0][1],cov[0][2]));
+    merged.covB = packed_half3(half3(cov[1][1],cov[1][2],cov[2][2]));
+    points[parent] = merged;
+    for (uint j = 0; j < 9; ++j) sh[parent * 9 + j] = half(coeff[j]);
+    float mergedRadius = lodRadius(lodCovariance(merged));
+    bounds[boundID] = float4(center, max(radius, mergedRadius));
+}
+
+// Work only with the drawable's logical-to-physical transform on the GPU.
+// The two axes are separable. Include every logical pixel in a cell, retaining
+// the maximum density so a narrow high-rate interval cannot be averaged away.
+kernel void prismSampleRates(constant rasterization_rate_map_data &mapData [[buffer(0)]],
+                             device float2 *rates [[buffer(1)]], constant uint4 &mapInfo [[buffer(2)]],
+                             uint lane [[thread_index_in_threadgroup]], uint wave [[simdgroup_index_in_threadgroup]],
+                             uint simdLane [[thread_index_in_simdgroup]]) {
+    rasterization_rate_map_decoder decoder(mapData);
+    uint2 size = mapInfo.xy, start = lane * size / rateCells, end = ((lane+1) * size + rateCells-1) / rateCells;
+    float2 rate = float2(0);
+    for (uint n=0; n < max(end.x-start.x, end.y-start.y); ++n) {
+        float2 p = min(float2(start+n), float2(size-1));
+        float2 a = decoder.map_screen_to_physical_coordinates(p, mapInfo.z);
+        float2 b = decoder.map_screen_to_physical_coordinates(p + 1.f, mapInfo.z);
+        rate = max(rate, b-a);
+    }
+    rates[lane] = rate;
+    threadgroup float2 maxima[4];
+    float2 peak = simd_max(rate);
+    if (simdLane == 0) maxima[wave] = peak;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) rates[rateCells] = max(max(maxima[0],maxima[1]),max(maxima[2],maxima[3]));
+}
+
+struct LODView {
+    float4x4 clip;
+    float4 viewport;
+    float2 mapSize;
+    float2 focal;
+};
+
+kernel void prismSelectParents(device const float4 *bounds [[buffer(0)]], device uchar *decisions [[buffer(1)]],
+                               constant LODView *eyes [[buffer(2)]], device const float2 *rates [[buffer(3)]],
+                               constant uint2 &config [[buffer(4)]], constant float2 &limits [[buffer(5)]], constant uint &outputOffset [[buffer(6)]],
+                               uint group [[thread_position_in_grid]]) {
+    if (group >= config.x) return;
+    float4 sphere = bounds[group];
+    bool shrink = isfinite(sphere.w);
+    for (uint i=0; i<config.y && shrink; ++i) {
+        LODView eye = eyes[i];
+        float4 clip = eye.clip * float4(sphere.xyz, 1);
+        if (clip.w <= sphere.w || clip.z < 0 || clip.z > clip.w) { shrink = false; break; }
+        float2 ndc = clip.xy / clip.w;
+        // Bound a perspective-projected sphere even with an off-axis eye.
+        float2 ndcExtent = (eye.focal + abs(ndc)) * sphere.w / (clip.w - sphere.w);
+        float2 extent = ndcExtent * eye.viewport.zw * 0.5f + 3.f;
+        float2 pixel = eye.viewport.xy + (ndc * float2(.5f,-.5f) + .5f) * eye.viewport.zw;
+        float2 lo = pixel - extent, hi = pixel + extent;
+        if (any(hi < eye.viewport.xy) || any(lo > eye.viewport.xy + eye.viewport.zw)) continue;
+        device const float2 *table = rates + i * (rateCells+1);
+        float2 peak = table[rateCells];
+        if (any(peak < 0.01f) || any(extent > max(160.f, limits.x * 10.f))) { shrink = false; break; }
+        // Two extra cells protect motion and the boundary of the high-detail region.
+        int2 first = clamp(int2(floor(lo / eye.mapSize * rateCells)) - 2, 0, int(rateCells-1));
+        int2 last  = clamp(int2(floor(hi / eye.mapSize * rateCells)) + 2, 0, int(rateCells-1));
+        float2 maxRate = 0;
+        for (int x=first.x; x<=last.x; ++x) maxRate.x = max(maxRate.x, table[x].x);
+        for (int y=first.y; y<=last.y; ++y) maxRate.y = max(maxRate.y, table[y].y);
+        float2 normalized = maxRate / peak;
+        shrink = normalized.x * normalized.y < limits.y && all(extent * maxRate <= limits.x);
+    }
+    decisions[outputOffset + group] = uchar(shrink);
+}

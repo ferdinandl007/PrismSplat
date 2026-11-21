@@ -1,0 +1,360 @@
+// Screen-space index for the Mac preview. Keep the ordering of the exact depth sort
+// while bucketing references by tile. Large ellipses have a separate 128px grid.
+constant uint screenTileSize = PRISM_TILE_SIZE;
+constant uint coarseTileSize = PRISM_COARSE_TILE_SIZE;
+constant uint fineReferenceLimit = PRISM_FINE_REFERENCE_LIMIT;
+constant uint tileBatch = PRISM_TILE_BATCH;
+constant uint tileWaves = (PRISM_TILE_SIZE * PRISM_TILE_SIZE / 4 + 31) / 32;
+
+struct ScreenTiles {
+    uint2 size;
+    uint2 fineGrid;
+    uint2 coarseGrid;
+    uint referenceCapacity;
+    uint padding;
+};
+
+struct ProjectedPoint {
+    float2 center;
+    float2 inverseX;
+    float2 inverseY;
+    half4 color;
+};
+
+struct ScreenFootprint {
+    ushort2 first;
+    ushort2 last;
+    uint mask;
+    uint count;
+};
+
+static_assert(sizeof(ProjectedPoint) == 32, "Keep the projected point stride in sync with Swift");
+static_assert(sizeof(ScreenFootprint) == 16, "Keep the screen footprint stride in sync with Swift");
+
+inline float tileQuadratic(float2 d, float2 x, float2 y) {
+    float2 p = float2(dot(d, x), dot(d, y));
+    return dot(p, p);
+}
+
+inline bool ellipseTouchesTile(float2 lo, float2 hi, float2 x, float2 y) {
+    if (all(lo <= 0) && all(hi >= 0)) return true;
+    float xx = x.x * x.x + y.x * y.x;
+    float xy = x.x * x.y + y.x * y.y;
+    float yy = x.y * x.y + y.y * y.y;
+    if (min(xx, yy) < 1e-10f) return true;
+    float alongX = -xy / xx;
+    float alongY = -xy / yy;
+    const float limit = 9.02f;
+    return tileQuadratic(float2(clamp(alongX * lo.y, lo.x, hi.x), lo.y), x, y) <= limit ||
+           tileQuadratic(float2(clamp(alongX * hi.y, lo.x, hi.x), hi.y), x, y) <= limit ||
+           tileQuadratic(float2(lo.x, clamp(alongY * lo.x, lo.y, hi.y)), x, y) <= limit ||
+           tileQuadratic(float2(hi.x, clamp(alongY * hi.x, lo.y, hi.y)), x, y) <= limit;
+}
+
+kernel void prismTileProject(
+    device const Splat *splats [[buffer(0)]],
+    device const half *harmonics [[buffer(1)]],
+    device const uint2 *depthOrder [[buffer(2)]],
+    device const SortState *depth [[buffer(3)]],
+    constant Uniforms &view [[buffer(4)]],
+    constant ScreenTiles &grid [[buffer(5)]],
+    device ProjectedPoint *projected [[buffer(6)]],
+    device ScreenFootprint *footprints [[buffer(7)]],
+    device uint *localOffsets [[buffer(8)]],
+    device uint *groupCounts [[buffer(9)]],
+    uint rank [[thread_position_in_grid]],
+    uint threadIndex [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    ScreenFootprint footprint = {};
+    if (rank < depth->visible) {
+        // Reversing the exact stable order also reverses equal-depth ties.
+        uint source = depthOrder[depth->visible - 1 - rank].y;
+        SplatEllipse e = projectSplat(splats[source], view, harmonics, SHDegree1, source);
+        float2 axis1 = float2(e.axis1) * float2(1, -1);
+        float2 axis2 = float2(e.axis2) * float2(1, -1);
+        float determinant = axis1.x * axis2.y - axis1.y * axis2.x;
+        if (e.color.a > 0 && isfinite(determinant) && abs(determinant) > 1e-12f) {
+            float2 center = (e.center.xy / e.center.w * float2(0.5f, -0.5f) + 0.5f) * float2(grid.size);
+            float2 extent = 3.005f * sqrt(axis1 * axis1 + axis2 * axis2);
+            float2 lo = max(0.0f, center - extent);
+            float2 hi = min(float2(grid.size), center + extent);
+            if (all(lo < hi)) {
+                float2 invX = float2(axis2.y, -axis2.x) / determinant;
+                float2 invY = float2(-axis1.y, axis1.x) / determinant;
+                uint2 first = uint2(lo) / screenTileSize;
+                uint2 last = min(grid.fineGrid - 1, uint2(hi) / screenTileSize);
+                uint2 span = last - first + 1;
+                if (span.x * span.y > fineReferenceLimit) {
+                    first = uint2(lo) / coarseTileSize;
+                    last = min(grid.coarseGrid - 1, uint2(hi) / coarseTileSize);
+                    span = last - first + 1;
+                    footprint.count = span.x * span.y;
+                } else {
+                    for (uint bit = 0; bit < span.x * span.y; ++bit) {
+                        uint2 tile = first + uint2(bit % span.x, bit / span.x);
+                        float2 tileLo = float2(tile * screenTileSize);
+                        float2 tileHi = min(float2(grid.size), tileLo + screenTileSize);
+                        if (!PRISM_EXACT_TILE_BOUNDS || ellipseTouchesTile(tileLo - center, tileHi - center, invX, invY))
+                            footprint.mask |= 1u << bit;
+                    }
+                    footprint.count = popcount(footprint.mask);
+                }
+                footprint.first = ushort2(first);
+                footprint.last = ushort2(last);
+                if (footprint.count > 0) projected[rank] = {center, invX, invY, e.color};
+            }
+        }
+        footprints[rank] = footprint;
+    }
+    threadgroup uint sums[subgroups];
+    uint offset = tilePrefix(footprint.count, lane, simd, sums);
+    if (rank < depth->visible) localOffsets[rank] = offset;
+    if (threadIndex == tileWidth - 1) groupCounts[group] = offset + footprint.count;
+}
+
+// Four values per scan lane support up to 8,388,608 references. For the
+// initial scan, generate an empty tile draw and enable the indexed fallback
+// if the input doesn't fit. This never drops geometry on a wide viewport.
+kernel void prismScanTileReferences(device uint *chunks [[buffer(0)]],
+                                    device uint *binTotals [[buffer(1)]],
+                                    device SortState *references [[buffer(2)]],
+                                    constant uint &stride [[buffer(3)]],
+                                    constant uint &radix [[buffer(4)]],
+                                    constant ScreenTiles &grid [[buffer(5)]],
+                                    device const SortState *depth [[buffer(6)]],
+                                    uint bin [[threadgroup_position_in_grid]],
+                                    uint threadIndex [[thread_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint simd [[simdgroup_index_in_threadgroup]]) {
+    uint count = radix ? references->tiles : groupsFor(depth->groups);
+    uint index = threadIndex * 4;
+    uint location = bin * stride + index;
+    uint4 part = 0;
+    for (uint i = 0; i < 4; ++i)
+        if (index + i < count) part[i] = chunks[location + i];
+    uint sum = part.x + part.y + part.z + part.w;
+    threadgroup uint sums[subgroups];
+    uint offset = tilePrefix(sum, lane, simd, sums);
+    for (uint i = 0; i < 4; ++i) {
+        if (index + i < count) chunks[location + i] = offset;
+        offset += part[i];
+    }
+    if (threadIndex != tileWidth - 1) return;
+    if (radix) {
+        binTotals[bin] = offset;
+    } else {
+        bool fits = offset <= grid.referenceCapacity;
+        uint groups = max(1u, groupsFor(fits ? offset : 0u));
+        references->visible = fits ? offset : 0;
+        references->groups = groups;
+        references->tiles = groupsFor(groups);
+        references->unused = offset;
+        references->sortGrid = uint3(groups, 1, 1);
+        references->scanGrid = uint3(references->tiles, digitCount, 1);
+        references->draw = fits ? DrawArguments{0, 0, 0, 0, 0} : depth->draw;
+    }
+}
+
+kernel void prismTileEmit(device const ScreenFootprint *footprints [[buffer(0)]],
+                          device const uint *localOffsets [[buffer(1)]],
+                          device const uint *groupOffsets [[buffer(2)]],
+                          device const uint *chunkOffsets [[buffer(3)]],
+                          device const SortState *depth [[buffer(4)]],
+                          device const SortState *references [[buffer(5)]],
+                          constant ScreenTiles &grid [[buffer(6)]],
+                          device ushort *keys [[buffer(7)]],
+                          device uint *ranks [[buffer(8)]],
+                          uint rank [[thread_position_in_grid]],
+                          uint group [[threadgroup_position_in_grid]]) {
+    if (rank >= depth->visible || references->visible == 0) return;
+    ScreenFootprint footprint = footprints[rank];
+    if (footprint.count == 0) return;
+    uint target = chunkOffsets[group / tileWidth] + groupOffsets[group] + localOffsets[rank];
+    uint2 first = uint2(footprint.first);
+    uint width = footprint.last.x - footprint.first.x + 1;
+    if (footprint.mask != 0) {
+        uint bits = footprint.mask;
+        while (bits != 0) {
+            uint bit = ctz(bits);
+            uint2 tile = first + uint2(bit % width, bit / width);
+            keys[target] = ushort(tile.y * grid.fineGrid.x + tile.x);
+            ranks[target++] = rank;
+            bits &= bits - 1;
+        }
+    } else {
+        uint coarseBase = grid.fineGrid.x * grid.fineGrid.y;
+        for (uint y = first.y; y <= footprint.last.y; ++y) {
+            uint key = coarseBase + y * grid.coarseGrid.x + first.x;
+            for (uint x = 0; x < width; ++x) {
+                keys[target] = ushort(key + x);
+                ranks[target++] = rank;
+            }
+        }
+    }
+}
+
+kernel void prismClearTileRanges(device uint *ranges [[buffer(0)]],
+                                 constant uint &count [[buffer(1)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i < count) ranges[i] = 0;
+}
+
+kernel void prismTileRanges(device const ushort *keys [[buffer(0)]],
+                            device const SortState *references [[buffer(1)]],
+                            device uint *ranges [[buffer(2)]],
+                            uint i [[thread_position_in_grid]]) {
+    if (i >= references->visible) return;
+    uint key = keys[i];
+    if (i == 0 || keys[i - 1] != key) ranges[key * 2] = i;
+    if (i + 1 == references->visible || keys[i + 1] != key) ranges[key * 2 + 1] = i + 1;
+}
+
+// Find the fine-list rank at a merged offset. The total is at most one
+// batch, so each lane only searches up to 32 candidates in either list.
+inline uint mergeFine(device const uint *keys, uint2 fine, uint2 coarse, uint offset) {
+    uint fineCount = fine.y - fine.x;
+    uint coarseCount = coarse.y - coarse.x;
+    uint low = offset > coarseCount ? offset - coarseCount : 0u;
+    uint high = min(offset, fineCount);
+    while (low < high) {
+        uint mid = (low + high) / 2;
+        uint coarseUsed = offset - mid;
+        if (coarseUsed > 0 && keys[fine.x + mid] < keys[coarse.x + coarseUsed - 1]) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
+kernel void prismTileBlend(texture2d<half, access::write> output [[texture(0)]],
+                          device const ProjectedPoint *points [[buffer(0)]],
+                          device const uint *keys [[buffer(1)]],
+                          device const uint *ranges [[buffer(2)]],
+                          device const SortState *references [[buffer(3)]],
+                          constant ScreenTiles &grid [[buffer(4)]],
+                          uint2 tile [[threadgroup_position_in_grid]],
+                          uint2 pixelInTile [[thread_position_in_threadgroup]],
+                          uint lane [[thread_index_in_threadgroup]],
+                          uint simdLane [[thread_index_in_simdgroup]],
+                          uint simd [[simdgroup_index_in_threadgroup]]) {
+    if (references->unused > grid.referenceCapacity) return;
+    uint tileID = tile.y * grid.fineGrid.x + tile.x;
+    uint2 coarseCoord = tile / (coarseTileSize / screenTileSize);
+    uint coarseID = grid.fineGrid.x * grid.fineGrid.y + coarseCoord.y * grid.coarseGrid.x + coarseCoord.x;
+    uint2 fine = uint2(ranges[tileID * 2], ranges[tileID * 2 + 1]);
+    uint2 coarse = uint2(ranges[coarseID * 2], ranges[coarseID * 2 + 1]);
+    // Share the inverse ellipse transform and the splat load across a 2 × 2
+    // pixel block. The other three sample locations are additive offsets.
+    uint2 pixel = tile * screenTileSize + pixelInTile * 2;
+    uint4 x = pixel.x + uint4(0, 1, 0, 1);
+    uint4 y = pixel.y + uint4(0, 0, 1, 1);
+    bool4 inImage = (x < grid.size.x) & (y < grid.size.y);
+    float2 samplePos = float2(pixel) + 0.5f;
+    float4 red = 0, green = 0, blue = 0;
+    float4 t = select(float4(0), float4(1), inImage);
+    const float cutoff = PRISM_CUTOFF_EXPONENT == 0 ? 0.0f : 1.0f / float(1u << PRISM_CUTOFF_EXPONENT);
+
+    threadgroup ProjectedPoint batch[tileBatch];
+    threadgroup uint2 advances;
+    threadgroup bool activeWaves[tileWaves];
+    uint remaining = fine.y - fine.x + coarse.y - coarse.x;
+    while (remaining > 0) {
+        uint batchCount = min(tileBatch, remaining);
+        if (lane < batchCount) {
+            uint usedFine = mergeFine(keys, fine, coarse, lane);
+            uint usedCoarse = lane - usedFine;
+            uint f = fine.x + usedFine < fine.y ? keys[fine.x + usedFine] : UINT_MAX;
+            uint c = coarse.x + usedCoarse < coarse.y ? keys[coarse.x + usedCoarse] : UINT_MAX;
+            batch[lane] = points[min(f,c)];
+            if (lane + 1 == batchCount) advances = uint2(usedFine + uint(f < c), usedCoarse + uint(c < f));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (any(t > cutoff)) {
+            for (uint i = 0; i < batchCount; ++i) {
+                const ProjectedPoint p = batch[i];
+                float2 d = samplePos - p.center;
+                half4 u = half4(dot(d,p.inverseX) + float4(0, p.inverseX.x, p.inverseX.y, p.inverseX.x+p.inverseX.y));
+                half4 v = half4(dot(d,p.inverseY) + float4(0, p.inverseY.x, p.inverseY.y, p.inverseY.x+p.inverseY.y));
+                half4 distance = u*u + v*v;
+                bool4 active = (distance <= kBoundsRadiusSquared) & (t > cutoff);
+                if (any(active)) {
+                    half4 alpha = select(half4(0), exp(-0.5h * distance) * p.color.a, active);
+                    red += t * float4(p.color.r * alpha);
+                    green += t * float4(p.color.g * alpha);
+                    blue += t * float4(p.color.b * alpha);
+                    t *= 1.0f - float4(alpha);
+                    if (!any(t > cutoff)) break;
+                }
+            }
+        }
+        fine.x += advances.x;
+        coarse.x += advances.y;
+        remaining -= batchCount;
+        bool active = simd_any(any(t > cutoff));
+        if (simdLane == 0) activeWaves[simd] = active;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The next batch's barrier precedes any subsequent write to activeWaves.
+        bool tileActive = false;
+        for (uint wave = 0; wave < tileWaves; ++wave) tileActive |= activeWaves[wave];
+        if (!tileActive) break;
+    }
+    for (uint i = 0; i < 4; ++i)
+        if (inImage[i]) output.write(half4(red[i], green[i], blue[i], 1), uint2(x[i], y[i]));
+
+}
+
+vertex float4 prismTileResolveVertex(uint vertexID [[vertex_id]]) {
+    return float4(vertexID == 2 ? 3.0f : -1.0f, vertexID == 0 ? -3.0f : 1.0f, 0, 1);
+}
+
+fragment half4 prismTileResolve(float4 p [[position]],
+                                texture2d<half, access::read> source [[texture(0)]],
+                                device const SortState *references [[buffer(0)]],
+                                constant uint &capacity [[buffer(1)]]) {
+    if (references->unused > capacity) discard_fragment();
+    return source.read(uint2(p.xy));
+}
+
+kernel void prismCompactHistogram(device const ushort *input [[buffer(0)]],
+                           device uint *counts [[buffer(1)]],
+                           device const SortState *state [[buffer(2)]],
+                           constant uint &capacity [[buffer(3)]],
+                           constant uint &shift [[buffer(4)]],
+                           uint index [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint simd [[simdgroup_index_in_threadgroup]],
+                           uint group [[threadgroup_position_in_grid]]) {
+    bool active = index < state->visible;
+    uint digit = active ? ((uint(input[index]) >> shift) & 15) : 0;
+    threadgroup uint local[subgroups * digitCount];
+    countRadixDigit(active, digit, lane, simd, group, capacity, counts, local);
+}
+
+kernel void prismCompactScatter(device const ushort *input [[buffer(0)]],
+                         device ushort *output [[buffer(1)]],
+                         device const uint *offsets [[buffer(2)]],
+                         device const uint *tileOffsets [[buffer(3)]],
+                         device const uint *binTotals [[buffer(4)]],
+                         device const SortState *state [[buffer(5)]],
+                         constant uint &capacity [[buffer(6)]],
+                         constant uint &ceilingTiles [[buffer(7)]],
+                         constant uint &shift [[buffer(8)]],
+                         device const uint *ranks [[buffer(9)]],
+                         device uint *rankOut [[buffer(10)]],
+                         uint index [[thread_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint simd [[simdgroup_index_in_threadgroup]],
+                         uint group [[threadgroup_position_in_grid]]) {
+    bool active = index < state->visible;
+    ushort entry = active ? input[index] : ushort(0);
+    uint digit = (uint(entry) >> shift) & 15;
+    threadgroup uint local[subgroups * digitCount];
+    threadgroup uint bucketStart[digitCount];
+    uint slot = rankRadixDigit(active, digit, lane, simd, group, capacity, ceilingTiles,
+                               offsets, tileOffsets, binTotals, local, bucketStart);
+    if (active) {
+        output[slot] = entry;
+        rankOut[slot] = ranks[index];
+    }
+}

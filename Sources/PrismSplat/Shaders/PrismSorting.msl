@@ -1,0 +1,271 @@
+// Stable compaction and least-significant-digit radix sorting. Each digit uses
+// four SIMD ballots, followed by scans over per-threadgroup histograms.
+constant uint tileWidth = 128;
+constant uint simdWidth = 32;
+constant uint digitCount = 16;
+constant uint subgroups = tileWidth / simdWidth;
+constant uint splatsPerInstance = 256;
+
+struct SortView {
+    float4x4 clipFromCapture;
+    float2 ellipseMargin;
+    float2 pixelMargin;
+};
+
+struct SortViews {
+    SortView eyes[2];
+    float4 origin;
+    float4 forward;
+    uint count;
+    uint eyeCount;
+    uint2 padding;
+};
+
+struct DrawArguments { uint indexCount, instanceCount, indexStart; int baseVertex; uint baseInstance; };
+
+struct SortState {
+    uint visible;
+    uint groups;
+    uint tiles;
+    uint unused;
+    uint3 sortGrid;
+    uint3 scanGrid;
+    DrawArguments draw;
+};
+
+inline uint groupsFor(uint count) { return (count + tileWidth - 1) / tileWidth; }
+
+inline uint tilePrefix(uint value, uint lane, uint simd, threadgroup uint *sums) {
+    uint local = simd_prefix_exclusive_sum(value);
+    if (lane == simdWidth - 1) sums[simd] = local + value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < simd; i++) local += sums[i];
+    return local;
+}
+
+kernel void prismCull(device const Splat *splats [[buffer(0)]],
+                      device uint2 *selected [[buffer(1)]],
+                      device uint *counts [[buffer(2)]],
+                      constant SortViews &views [[buffer(3)]],
+#if PRISM_GEOMETRY_LOD
+                      device const uchar *parents [[buffer(4)]],
+#if PRISM_SPATIAL_LOD
+                      device const uint *leafSlots [[buffer(5)]],
+#endif
+#endif
+                      uint index [[thread_position_in_grid]],
+                      uint threadIndex [[thread_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]],
+                      uint simd [[simdgroup_index_in_threadgroup]],
+                      uint group [[threadgroup_position_in_grid]]) {
+    bool keep = false;
+    float3 center = float3(0);
+    uint source = index;
+    bool eligible = index < views.count;
+#if PRISM_GEOMETRY_LOD
+    uint level = views.padding.y >> 8;
+    uint sourceSpan = 1u << (3 * level), slot = index * sourceSpan;
+    eligible = slot < views.count;
+    if (eligible && (level != 0 || views.padding.x)) {
+        uint small = (views.count + 7) / 8, medium = (small + 7) / 8;
+#if PRISM_SPATIAL_LOD
+        if (level == 0) slot = leafSlots[index];
+#endif
+        bool deeper = views.padding.x && (views.padding.y & 1);
+        uint span = 1, node = 0;
+        if (level == 3 || (deeper && parents[small + medium + slot / 512])) {
+            node = small + medium + slot / 512; span = 512;
+        } else if (level == 2 || (deeper && parents[small + slot / 64])) {
+            node = small + slot / 64; span = 64;
+        } else if (level == 1 || (views.padding.x && parents[slot / 8])) {
+            node = slot / 8; span = 8;
+        }
+        if (span > 1) {
+            eligible = slot % span == 0;
+            source = views.count + node;
+        }
+    }
+#endif
+    if (eligible && splats[source].color.a > 0) {
+        center = float3(splats[source].position);
+        for (uint eye = 0; eye < views.eyeCount; ++eye) {
+            const float4 clip = views.eyes[eye].clipFromCapture * float4(center, 1);
+            if (clip.w <= 0 || clip.z < 0 || clip.z > clip.w) continue;
+            if (abs(clip.x) <= clip.w && abs(clip.y) <= clip.w) {
+                keep = true;
+                break;
+            }
+            // Preserve wide ellipses whose centers sit outside the viewport.
+            // A sphere based on the covariance trace conservatively bounds the footprint.
+            const Splat splat = splats[source];
+            const float radius = 3 * sqrt(max(0.f, float(splat.covA.x) + float(splat.covB.x) + float(splat.covB.z)));
+            const float2 margin = radius * views.eyes[eye].ellipseMargin + clip.w * views.eyes[eye].pixelMargin;
+            keep |= all(abs(clip.xy) <= clip.w + margin);
+        }
+    }
+    threadgroup uint sums[subgroups];
+    uint outputSlot = tilePrefix(uint(keep), lane, simd, sums);
+    if (keep) {
+        float depth = dot(center - views.origin.xyz, views.forward.xyz);
+        uint bits = as_type<uint>(depth);
+        // Sort descending depth with monotonically ordered unsigned keys.
+        uint key = (bits >> 31) ? (bits | 0x80000000u) : ~ (bits | 0x80000000u);
+        selected[group * tileWidth + outputSlot] = uint2(key, source);
+    }
+    if (threadIndex == tileWidth - 1) counts[group] = outputSlot + uint(keep);
+}
+
+kernel void prismScanGroups(device uint *counts [[buffer(0)]],
+                            device uint *tileCounts [[buffer(1)]],
+                            constant uint &capacity [[buffer(2)]],
+                            constant uint &ceilingTiles [[buffer(3)]],
+                            device const SortState *state [[buffer(4)]],
+                            constant uint &radix [[buffer(5)]],
+                            uint2 tile [[threadgroup_position_in_grid]],
+                            uint threadIndex [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint simd [[simdgroup_index_in_threadgroup]]) {
+    uint limit = radix ? state->groups : capacity;
+    uint i = tile.x * tileWidth + threadIndex;
+    uint location = tile.y * capacity + i;
+    uint value = i < limit ? counts[location] : 0;
+    threadgroup uint sums[subgroups];
+    uint offset = tilePrefix(value, lane, simd, sums);
+    if (i < limit) counts[location] = offset;
+    if (threadIndex == tileWidth - 1) tileCounts[tile.y * ceilingTiles + tile.x] = offset + value;
+}
+
+kernel void prismScanTiles(device uint *tileCounts [[buffer(0)]],
+                           device uint *binTotals [[buffer(1)]],
+                           device SortState *state [[buffer(2)]],
+                           constant uint &ceilingTiles [[buffer(3)]],
+                           constant uint &radix [[buffer(4)]],
+                           uint bin [[threadgroup_position_in_grid]],
+                           uint threadIndex [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint simd [[simdgroup_index_in_threadgroup]]) {
+    uint tiles = radix ? state->tiles : ceilingTiles;
+    uint index = threadIndex * 2;
+    uint location = bin * ceilingTiles + index;
+    uint first = index < tiles ? tileCounts[location] : 0;
+    uint second = index + 1 < tiles ? tileCounts[location + 1] : 0;
+    threadgroup uint sums[subgroups];
+    uint offset = tilePrefix(first + second, lane, simd, sums);
+    if (index < tiles) tileCounts[location] = offset;
+    if (index + 1 < tiles) tileCounts[location + 1] = offset + first;
+    if (threadIndex != tileWidth - 1) return;
+    uint total = offset + first + second;
+    if (radix) {
+        binTotals[bin] = total;
+    } else {
+        uint groups = max(1u, groupsFor(total));
+        uint activeTiles = groupsFor(groups);
+        state->visible = total;
+        state->groups = groups;
+        state->tiles = activeTiles;
+        state->sortGrid = uint3(groups, 1, 1);
+        state->scanGrid = uint3(activeTiles, digitCount, 1);
+        state->draw = { splatsPerInstance * 6, (total + splatsPerInstance - 1) / splatsPerInstance, 0, 0, 0 };
+    }
+}
+
+kernel void prismCompact(device const uint2 *selected [[buffer(0)]],
+                         device uint2 *dense [[buffer(1)]],
+                         device const uint *offsets [[buffer(2)]],
+                         device const uint *tileOffsets [[buffer(3)]],
+                         device const SortState *state [[buffer(4)]],
+                         constant uint &groups [[buffer(5)]],
+                         uint local [[thread_index_in_threadgroup]],
+                         uint group [[threadgroup_position_in_grid]]) {
+    uint start = tileOffsets[group / tileWidth] + offsets[group];
+    uint next = group + 1;
+    uint end = next < groups ? tileOffsets[next / tileWidth] + offsets[next] : state->visible;
+    if (local < end - start) dense[start + local] = selected[group * tileWidth + local];
+}
+
+inline uint digitMask(uint digit, uint4 masks, uint active) {
+    return active & (digit & 1 ? masks.x : ~masks.x) &
+                    (digit & 2 ? masks.y : ~masks.y) &
+                    (digit & 4 ? masks.z : ~masks.z) &
+                    (digit & 8 ? masks.w : ~masks.w);
+}
+
+inline uint ballot32(bool predicate) { return uint((simd_vote::vote_t)simd_ballot(predicate)); }
+
+inline uint4 digitBallots(uint digit) {
+    return uint4(ballot32((digit & 1) != 0),
+                 ballot32((digit & 2) != 0),
+                 ballot32((digit & 4) != 0),
+                 ballot32((digit & 8) != 0));
+}
+
+inline void countRadixDigit(bool active, uint digit, uint lane, uint simd, uint group, uint capacity,
+                            device uint *counts, threadgroup uint *local) {
+    uint4 masks = digitBallots(digit);
+    uint valid = ballot32(active);
+    if (lane < digitCount) local[simd * digitCount + lane] = popcount(digitMask(lane, masks, valid));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0 && lane < digitCount) {
+        uint count = 0;
+        for (uint i = 0; i < subgroups; ++i) count += local[i * digitCount + lane];
+        counts[lane * capacity + group] = count;
+    }
+}
+
+inline uint rankRadixDigit(bool active, uint digit, uint lane, uint simd, uint group, uint capacity,
+                           uint ceilingTiles, device const uint *offsets, device const uint *tileOffsets,
+                           device const uint *binTotals, threadgroup uint *local, threadgroup uint *bucketStart) {
+    uint4 masks = digitBallots(digit);
+    uint valid = ballot32(active);
+    if (lane < digitCount) local[simd * digitCount + lane] = popcount(digitMask(lane, masks, valid));
+    if (simd == 0) {
+        uint base = simd_prefix_exclusive_sum(lane < digitCount ? binTotals[lane] : 0);
+        if (lane < digitCount) {
+            bucketStart[lane] = base + offsets[lane * capacity + group] +
+                tileOffsets[lane * ceilingTiles + group / tileWidth];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return 0;
+    uint slot = bucketStart[digit] + popcount(digitMask(digit, masks, valid) & ((1u << lane) - 1));
+    for (uint i = 0; i < simd; ++i) slot += local[i * digitCount + digit];
+    return slot;
+}
+
+kernel void prismHistogram(device const uint2 *input [[buffer(0)]],
+                           device uint *counts [[buffer(1)]],
+                           device const SortState *state [[buffer(2)]],
+                           constant uint &capacity [[buffer(3)]],
+                           constant uint &shift [[buffer(4)]],
+                           uint index [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint simd [[simdgroup_index_in_threadgroup]],
+                           uint group [[threadgroup_position_in_grid]]) {
+    bool active = index < state->visible;
+    uint digit = active ? ((input[index].x >> shift) & 15) : 0;
+    threadgroup uint local[subgroups * digitCount];
+    countRadixDigit(active, digit, lane, simd, group, capacity, counts, local);
+}
+
+kernel void prismScatter(device const uint2 *input [[buffer(0)]],
+                         device uint2 *output [[buffer(1)]],
+                         device const uint *offsets [[buffer(2)]],
+                         device const uint *tileOffsets [[buffer(3)]],
+                         device const uint *binTotals [[buffer(4)]],
+                         device const SortState *state [[buffer(5)]],
+                         constant uint &capacity [[buffer(6)]],
+                         constant uint &ceilingTiles [[buffer(7)]],
+                         constant uint &shift [[buffer(8)]],
+                         uint index [[thread_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint simd [[simdgroup_index_in_threadgroup]],
+                         uint group [[threadgroup_position_in_grid]]) {
+    bool active = index < state->visible;
+    uint2 entry = active ? input[index] : uint2(0);
+    uint digit = (entry.x >> shift) & 15;
+    threadgroup uint local[subgroups * digitCount];
+    threadgroup uint bucketStart[digitCount];
+    uint slot = rankRadixDigit(active, digit, lane, simd, group, capacity, ceilingTiles,
+                               offsets, tileOffsets, binTotals, local, bucketStart);
+    if (active) output[slot] = entry;
+}

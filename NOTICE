@@ -1,0 +1,8 @@
+PrismSplat includes portions of MetalSplatter by Sean Cier, used under the MIT
+License. The upstream revision is 464eb37c55d90d7362a79120fdf8b50d4ae03296.
+https://github.com/scier/MetalSplatter/tree/464eb37c55d90d7362a79120fdf8b50d4ae03296
+
+The Metal splat layout, spherical-harmonic evaluation, covariance projection,
+and imageblock blending are adapted from MetalSplatter. PrismSplat adds GPU
+frustum compaction, radix depth sorting, indirect drawing, geometry LOD, and
+screen-space tile compositing. See LICENSE for both copyright notices.
