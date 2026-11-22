@@ -152,6 +152,7 @@ public final class MetalSplatRenderer {
     private let tiles: Int
     private let points: any MTLBuffer
     private let harmonics: any MTLBuffer
+    private let frameOwner = UUID()
     private let temporary: any MTLBuffer
     private let dense: any MTLBuffer
     private let scatter: any MTLBuffer
@@ -226,6 +227,7 @@ public final class MetalSplatRenderer {
         var macros = screenTileConfiguration.shaderMacros
         macros["PRISM_GEOMETRY_LOD"] = NSNumber(value: geometryLOD)
         macros["PRISM_SPATIAL_LOD"] = NSNumber(value: geometryLOD && spatialLOD)
+        macros["PRISM_FLAT_SPLAT_COLOR"] = NSNumber(value: capture.degree == 0)
         options.preprocessorMacros = macros
         let library = try device.makeLibrary(source: source, options: options)
         self.library = library
@@ -325,6 +327,44 @@ public final class MetalSplatRenderer {
                 for field in 0..<9 { sh[index * 9 + field] = file.degree > 0 ? half(value(14 + field)) : 0 }
             }
         }
+    }
+
+    /// An immutable upload for one animation frame. Retain only the frames needed for playback.
+    public struct PreparedFrame: @unchecked Sendable {
+        fileprivate let owner: UUID
+        fileprivate let points: any MTLBuffer
+        fileprivate let harmonics: any MTLBuffer
+
+        public var byteCount: Int { points.length + harmonics.length }
+    }
+
+    /// Returns a worker-safe encoder for captures with the renderer's original point count.
+    public func framePreparation() throws -> @Sendable (SplatFile) throws -> PreparedFrame {
+        guard geometryLOD == nil else { throw RendererError.invalidConfiguration }
+        let device = points.device
+        let pointsLength = points.length
+        let harmonicsLength = harmonics.length
+        let owner = frameOwner
+        let fixedCount = count
+        return { capture in
+            guard capture.count == fixedCount else { throw RendererError.invalidCapture }
+            guard let points = device.makeBuffer(length: pointsLength, options: .storageModeShared),
+                  let harmonics = device.makeBuffer(length: harmonicsLength, options: .storageModeShared) else {
+                throw RendererError.allocation
+            }
+            try Self.encode(capture, into: points, harmonics: harmonics)
+            return PreparedFrame(owner: owner, points: points, harmonics: harmonics)
+        }
+    }
+
+    /// Enqueues a geometry change before sorting and drawing on the same command queue.
+    public func encodeFrame(_ frame: PreparedFrame, on command: any MTLCommandBuffer) throws {
+        guard frame.owner == frameOwner else { throw RendererError.invalidConfiguration }
+        guard let blit = command.makeBlitCommandEncoder() else { throw RendererError.allocation }
+        blit.label = "Splat frame upload"
+        blit.copy(from: frame.points, sourceOffset: 0, to: points, destinationOffset: 0, size: points.length)
+        blit.copy(from: frame.harmonics, sourceOffset: 0, to: harmonics, destinationOffset: 0, size: harmonics.length)
+        blit.endEncoding()
     }
 
     /// Call on a single command queue. Tracked Metal buffers keep later frames

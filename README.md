@@ -1,74 +1,91 @@
 # PrismSplat
 
-PrismSplat is the Metal Gaussian splat renderer from Prism. It culls splats against the camera frustum, sorts the visible splats by depth on the GPU, and renders them with indirect draws. A screen-space path composites fine and coarse tiles front to back and falls back to the indexed renderer when the tile index exceeds its capacity.
+**A native Metal renderer for 3D Gaussian splatting and 4D Gaussian splat video on Apple Vision Pro and Mac.**
 
-- Load binary little-endian Gaussian splat PLY files with float32 fields, including LZFSE-compressed PLY at a `.lzfse` URL.
-- Render one view or a two-view texture array. The indexed path also supports rasterization-rate maps and optional geometry LOD.
-- Import spherical harmonic degrees 0 through 3. The renderer uses the DC and first-order coefficients.
-- Use Swift 6 with Metal on Apple silicon, targeting macOS 15, iOS 18, or visionOS 2 and later.
+Use PrismSplat from Swift to render a Gaussian splat scene or play a sequence of changing geometry. Metal culls and sorts splats on the GPU, then draws from the current camera pose in mono or stereo. The viewer can change perspective independently of the animation.
 
-## Add it to a project
+[Install](#install) · [Watch the Mac demos](#watch-the-mac-demos) · [Play Gaussian splat video](#play-gaussian-splat-video) · [Apple platform support](#apple-platform-support)
 
-In Xcode, add `https://github.com/ferdinandl007/PrismSplat.git` in **File → Add Package Dependencies**. Select the **PrismSplat** library and version **0.1.0** or later.
+## Watch the Mac demos
 
-For Swift Package Manager, add the package and list its product in your target’s dependencies.
+[![Kinetic Studio Gaussian splat video rendered with Metal on a MacBook Pro. A camera moves past a studio sculpture with rotating colored rings.](media/kinetic-studio.webp)](media/kinetic-studio-mac.mp4)
+
+**Kinetic Studio** · 144,000 Gaussians per geometry frame, sampled at 12 FPS and rendered on an M3 Max MacBook Pro. The camera shifts as the sculpture moves. The original scene was fitted offline with [Instant4D](https://github.com/Zhanpeng1202/Instant4D). [Watch or download the MP4](media/kinetic-studio-mac.mp4)
+
+[![Orbit Gaussian splat video rendered on Mac. The view shifts around a golden ringed planet on a violet backdrop.](media/orbit.webp)](media/orbit-mac.mp4)
+
+**Orbit** · A four-second SOG 3 stream rendered in Prism’s native Mac benchmark. [Watch or download the MP4](media/orbit-mac.mp4)
+
+## Apple platform support
+
+| Platform | Minimum version | Rendering |
+| --- | --- | --- |
+| **Apple Vision Pro** | visionOS 2 | Stereo Gaussian splats with per-eye views and projections. The indexed path accepts rasterization-rate maps. |
+| **Mac with Apple silicon** | macOS 15 | Mono and stereo camera views in native Metal. |
+| **iPhone and iPad** | iOS 18 | Native Metal rendering on supported devices. |
+
+PrismSplat is a Swift 6 package. The indexed renderer supports indirect draws and optional geometry LOD for static scenes. The screen-space renderer composites fine and coarse tiles front to back and falls back to indexed drawing when its tile index exceeds capacity.
+
+## Install
+
+In Xcode, choose **File → Add Package Dependencies**, enter `https://github.com/ferdinandl007/PrismSplat.git`, and add the **PrismSplat** product.
+
+For Swift Package Manager, add the dependency to `Package.swift` and the product to your target.
 
 ```swift
-.package(url: "https://github.com/ferdinandl007/PrismSplat.git", from: "0.1.0")
+.package(url: "https://github.com/ferdinandl007/PrismSplat.git", from: "0.2.0")
 ```
 
 ```swift
 .product(name: "PrismSplat", package: "PrismSplat")
 ```
 
-## Render a scene
+## Play Gaussian splat video
 
-Load the capture and create the renderer once. Use the same color format as your target texture. The package bundles the Metal shader sources and compiles the selected pipelines when the renderer is initialized.
+PrismSplat renders prepared Gaussian frames using one persistent Metal renderer. Set up the renderer with geometry LOD disabled, then reuse its frame preparation closure to stage upcoming frames off the render path. Each frame uses the renderer’s original splat count.
+
+```swift
+let prepareFrame = try renderer.framePreparation()
+
+// Prepare an upcoming capture on a worker.
+let prepared = try prepareFrame(upcomingCapture)
+
+// Queue the upload before sorting and drawing.
+try renderer.encodeFrame(prepared, on: commandBuffer)
+try renderer.render(eyes: eyes, color: target, on: commandBuffer)
+```
+
+Use `prepared.byteCount` to cap the size of your playback buffer. Keeping only the current frame and a few upcoming frames in memory lets a long clip exceed GPU memory. The host app supplies downloading, decoding, frame timing, and camera tracking.
+
+The **Prism app** combines this rendering approach with HTTPS streaming of [SOG 3](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/) frame sequences. Prism can load a short loop into memory or keep a rolling window of a longer segmented stream. The Swift package reads Gaussian splat PLY and LZFSE-compressed PLY. SOG decoding and the streaming player are part of the Prism app.
+
+## Render a static scene
+
+Load a binary little-endian Gaussian splat PLY with float32 fields, or its LZFSE-compressed equivalent at a `.lzfse` URL. The importer accepts spherical harmonic degrees 0 through 3. The renderer evaluates DC and first-order coefficients.
 
 ```swift
 import Metal
 import PrismSplat
-import QuartzCore
-import simd
 
-func makeRenderer(device: any MTLDevice, sceneURL: URL) async throws -> MetalSplatRenderer {
-    let capture = try await SplatFile.read(from: sceneURL, limit: 400_000)
-    return try MetalSplatRenderer(device: device, capture: capture, color: .bgra8Unorm_srgb)
-}
+let capture = try await SplatFile.read(from: sceneURL, limit: 400_000)
+let renderer = try MetalSplatRenderer(
+    device: device,
+    capture: capture,
+    color: .bgra8Unorm_srgb,
+    maxViews: 1
+)
 
-func drawFrame(
-    renderer: MetalSplatRenderer,
-    queue: any MTLCommandQueue,
-    drawable: any CAMetalDrawable,
-    projection: simd_float4x4,
-    view: simd_float4x4
-) throws {
-    let texture = drawable.texture
-    let viewport = MTLViewport(
-        originX: 0, originY: 0,
-        width: Double(texture.width), height: Double(texture.height),
-        znear: 0, zfar: 1
-    )
-    let eye = MetalSplatRenderer.Eye(viewport: viewport, projection: projection, view: view)
-    guard let commands = queue.makeCommandBuffer() else {
-        throw MetalSplatRenderer.RendererError.allocation
-    }
-    try renderer.render(eyes: [eye], color: texture, on: commands)
-    commands.present(drawable)
-    commands.commit()
-}
+try renderer.render(eyes: [eye], color: target, on: commandBuffer)
 ```
 
-The view matrix transforms the PLY’s coordinates into a camera space looking down −Z. Use a Metal perspective projection whose clip-space depth spans 0 to 1. Encode calls serially on the same Metal command queue for each renderer. Start with the default point limit and increase it to suit your memory and frame budget.
+Supply one `MetalSplatRenderer.Eye` per view. The view matrix transforms scene coordinates into camera space looking down −Z, and the Metal projection uses a clip-space depth range of 0 to 1. Encode work for each renderer serially on the same Metal command queue.
 
-For layered stereo, initialize with `maxViews: 2` and supply a two-slice render target with two eyes. For separate targets, call `encodeSort(eyes:on:)` for both eyes and then `draw(eyes:color:on:)` with one eye and its own target at a time. Configure a matching depth attachment format if you need a depth texture. The imageblock depth path uses reversed Z.
+- For layered stereo, use `maxViews: 2` and a two-slice texture array. The two eye descriptions supply their respective viewports and matrices.
+- For separate eye targets, call `encodeSort(eyes:on:)` once with both eyes and then `draw(eyes:color:on:)` with each eye and its own target.
+- For screen-space tiles, use `screenTiles: true` and `MetalSplatRenderer.ScreenTileRenderer(base:)`. Set `referenceLimit` to bound tile-index memory.
 
-For screen-space tiles, initialize the base renderer with `screenTiles: true` and create a `MetalSplatRenderer.ScreenTileRenderer(base:)`. Its `render(eye:color:on:)` takes one full-size viewport and a 2D color target. Set `referenceLimit` on creation to bound the tile-index memory.
+## Test and license
 
-## Test
+Run `swift test` on an Apple silicon Mac. The tests check PLY parsing, indexed drawing, tile compositing and fallback, stereo texture slices, and updates to animated geometry.
 
-Run `swift test` on an Apple silicon Mac. The tests generate their own PLY data, validate parsing, and read back GPU output from both draw paths.
-
-## License
-
-PrismSplat is available under the [MIT License](LICENSE). See [NOTICE](NOTICE) for the parts adapted from Sean Cier’s MetalSplatter.
+PrismSplat is available under the [MIT License](LICENSE). See [NOTICE](NOTICE) for attribution to Sean Cier’s MetalSplatter.

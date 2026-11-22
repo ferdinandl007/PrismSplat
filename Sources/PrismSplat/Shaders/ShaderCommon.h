@@ -104,5 +104,9 @@ typedef struct
 {
     float4 position [[position]];
     half2 relativePosition; // Ranges from -kBoundsRadius to +kBoundsRadius
+#if PRISM_FLAT_SPLAT_COLOR
+    half4 color [[flat]]; // All corners of a splat share the same color.
+#else
     half4 color;
+#endif
 } FragmentIn;
