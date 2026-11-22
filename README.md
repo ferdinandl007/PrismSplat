@@ -4,17 +4,15 @@
 
 Use PrismSplat from Swift to render a Gaussian splat scene or play a sequence of changing geometry. Metal culls and sorts splats on the GPU, then draws from the current camera pose in mono or stereo. The viewer can change perspective independently of the animation.
 
-[Install](#install) · [Watch the Mac demos](#watch-the-mac-demos) · [Play Gaussian splat video](#play-gaussian-splat-video) · [Apple platform support](#apple-platform-support)
+[Install](#install) · [Basketball demo](#basketball-demo) · [Play Gaussian splat video](#play-gaussian-splat-video) · [Apple platform support](#apple-platform-support)
 
-## Watch the Mac demos
+## Basketball demo
 
-[![Kinetic Studio Gaussian splat video rendered with Metal on a MacBook Pro. A camera moves past a studio sculpture with rotating colored rings.](media/kinetic-studio.webp)](media/kinetic-studio-mac.mp4)
+[![A basketball player raises his arms in a 4D Gaussian splat video rendered by PrismSplat on a MacBook Pro.](media/basketball.webp)](media/basketball-mac.mp4)
 
-**Kinetic Studio** · 144,000 Gaussians per geometry frame, sampled at 12 FPS and rendered on an M3 Max MacBook Pro. The camera shifts as the sculpture moves. The original scene was fitted offline with [Instant4D](https://github.com/Zhanpeng1202/Instant4D). [Watch or download the MP4](media/kinetic-studio-mac.mp4)
+Prism streams this SOG 3 sequence at 15 geometry frames per second with 72,000 splats per frame. The preview was rendered with PrismSplat on an M3 Max MacBook Pro, and we tested the same sequence on Apple Vision Pro. [Watch the Mac render](media/basketball-mac.mp4)
 
-[![Orbit Gaussian splat video rendered on Mac. The view shifts around a golden ringed planet on a violet backdrop.](media/orbit.webp)](media/orbit-mac.mp4)
-
-**Orbit** · A four-second SOG 3 stream rendered in Prism’s native Mac benchmark. [Watch or download the MP4](media/orbit-mac.mp4)
+Original volumetric capture by GeniusXR (Azad Abbasi). [PlayCanvas source demo](https://playcanvas.github.io/#/gaussian-splatting/flipbook)
 
 ## Apple platform support
 
